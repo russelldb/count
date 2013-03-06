@@ -1,0 +1,14 @@
+%% -*- erlang -*-
+{application, count,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib,
+                  riak_core
+                 ]},
+  {mod, { count_app, []}},
+  {env, []}
+ ]}.

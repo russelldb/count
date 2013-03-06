@@ -1,0 +1,7 @@
+*.beam
+.eunit
+deps/*
+ebin/*
+rel/count
+dev
+apps/count/src/*
