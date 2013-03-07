@@ -64,7 +64,7 @@ merge(PrefList, Key, Val, ReqId) ->
 %% @doc Sends a read-repair of a value
 -spec repair(riak_core_apl:preflist2(),  term(), term()) -> ok.
 repair(PrefList, Key, PNCounter) ->
-    riak_core_vnode_master:command(PrefList, {repair, Key, PNCounter, ignore}, ignore, ?MASTER).
+    riak_core_vnode_master:command(PrefList, {repair, Key, PNCounter}, ignore, ?MASTER).
 
 init([Partition]) ->
     Node = node(),
@@ -107,23 +107,10 @@ handle_command({get, Key, ReqId}, _Sender, State) ->
     %% into a PN-Counter and return it
     %% Checkpointed counter is stored on disk as a state based CRDT
     %% and an opcount, at Key, get that
-    CheckPointKey = checkpoint_key(Key),
-    {CPOpCount, PNCounter0} = get_checkpoint(StorageState, CheckPointKey),
-    KeyRange = make_key_range(Key, CPOpCount, OpCount),
-    FoldFun = fun(_K, V, {Size, PNCount}) ->
-                      {VnodeId, Count} = binary_to_term(V),
-                      case Count of
-                          N when N < 0 ->
-                              {Size+1, count_pncounter:update({decrement, N*-1}, VnodeId, PNCount)};
-                          P ->
-                              {Size+1, count_pncounter:update({increment, P}, VnodeId, PNCount)}
-                      end
-              end,
-    Acc = {0, PNCounter0},
-    {Size, PNCounter} = hanoidb:fold_range(StorageState, FoldFun, Acc, KeyRange),
+    {CheckPointKey, Size, PNCounter} = local_get(StorageState, Key, OpCount),
     lager:info("read size was ~p~n", [Size]),
     Reply = case PNCounter of
-                [{},{}] -> notfound; %% Empty PN-Counter, BAD, relies on knowledge of internal datastructure
+                {[], []} -> notfound; %% Empty PN-Counter, BAD, relies on knowledge of internal datastructure
                 _ -> {ok, {count_pncounter, PNCounter}}
             end,
     %% Checkpoint the counter again
@@ -133,9 +120,18 @@ handle_command({get, Key, ReqId}, _Sender, State) ->
         _ -> ok
     end,
     {reply, {ReqId, {{Idx, Node}, Reply}}, State};
-handle_command({repair, Key, PNCounter}, _Sender, State) ->
-    %% Not implemented yet
-    lager:warn("Asked to merge ~p ~p~n", [Key, PNCounter]),
+handle_command({repair, Key, {count_pncounter, PNCounter}}, _Sender, State) ->
+    lager:info("Getting read repaired at key ~p with val ~p~n", [Key, PNCounter]),
+    #state{op_count=OpCount, storage_state=StorageState} = State,
+    %% Read reair receives a state based PN-Counter, it seems the best thing to do
+    %% is do a local get (merge with the rr counter, and save the rollup)
+    {CheckPointKey, _Size, LocalCounter} = local_get(StorageState, Key, OpCount),
+    Merged = count_pncounter:merge(PNCounter, LocalCounter),
+    case count_pncounter:equal(Merged, LocalCounter) of
+        false ->
+            save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter});
+        true -> ok
+    end,
     {reply, ok, State};
 handle_command(Message, _Sender, State) ->
     ?PRINT({unhandled_command, Message}),
@@ -252,6 +248,23 @@ stop_storage(StorageState) ->
 %% -------
 %% Vnode
 %% -------
+local_get(StorageState, Key, OpCount) ->
+    CheckPointKey = checkpoint_key(Key),
+    {CPOpCount, PNCounter0} = get_checkpoint(StorageState, CheckPointKey),
+    KeyRange = make_key_range(Key, CPOpCount, OpCount),
+    FoldFun = fun(_K, V, {Size, PNCount}) ->
+                      {VnodeId, Count} = binary_to_term(V),
+                      case Count of
+                          N when N < 0 ->
+                              {Size+1, count_pncounter:update({decrement, N*-1}, VnodeId, PNCount)};
+                          P ->
+                              {Size+1, count_pncounter:update({increment, P}, VnodeId, PNCount)}
+                      end
+              end,
+    Acc = {0, PNCounter0},
+    {Size, PNCounter} = hanoidb:fold_range(StorageState, FoldFun, Acc, KeyRange),
+    {CheckPointKey, Size, PNCounter}.
+
 op_count_key() ->
     <<$o,$c>>.
 
