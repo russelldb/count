@@ -40,6 +40,7 @@
                 partition :: partition()}).
 
 -define(MASTER, count_vnode_master).
+-define(OP_THRESHOLD, 1000).
 
 %% API
 start_vnode(I) ->
@@ -70,7 +71,8 @@ init([Partition]) ->
     random:seed(erlang:now()),
     VnodeId = uuid:v4(),
     {ok, DataDir, StorageState} = start_storage(Partition),
-    OpCount = get_op_count(),
+    OpCount = get_op_count(StorageState),
+    lager:info("Started ~p with op count ~p~n", [Partition, OpCount]),
     {ok, #state { data_dir = DataDir,
                   node = Node,
                   op_count = OpCount,
@@ -85,12 +87,14 @@ handle_command({increment, Key, Amount}, _Sender, State) ->
     OpKey = counter_key(Key, OpCount),
     Val = term_to_binary({VnodeId, Amount}),
     store(StorageState, OpKey, Val),
+    maybe_store_opcount(StorageState, OpCount),
     {reply, {ok, Val}, State#state{op_count=OpCount}};
 handle_command({merge, Key, Val, ReqId}, _Sender, State) ->
     #state{storage_state=StorageState, op_count=OpCount0} = State,
     OpCount = OpCount0 + 1,
     OpKey = counter_key(Key, OpCount),
     store(StorageState, OpKey, Val),
+    maybe_store_opcount(StorageState, OpCount),
     {reply, {ReqId, ok}, State#state{op_count=OpCount}};
 handle_command({get, Key, ReqId}, _Sender, State) ->
     #state{storage_state=StorageState, op_count=OpCount, partition=Idx, node=Node} = State,
@@ -101,22 +105,33 @@ handle_command({get, Key, ReqId}, _Sender, State) ->
     %% To Key, CurrentOpCount)
     %% then turn all those elements
     %% into a PN-Counter and return it
-    KeyRange = make_key_range(Key, 0, OpCount),
-    FoldFun = fun(_K, V, PNCount) ->
+    %% Checkpointed counter is stored on disk as a state based CRDT
+    %% and an opcount, at Key, get that
+    CheckPointKey = checkpoint_key(Key),
+    {CPOpCount, PNCounter0} = get_checkpoint(StorageState, CheckPointKey),
+    KeyRange = make_key_range(Key, CPOpCount, OpCount),
+    FoldFun = fun(_K, V, {Size, PNCount}) ->
                       {VnodeId, Count} = binary_to_term(V),
                       case Count of
                           N when N < 0 ->
-                              count_pncounter:update({decrement, N*-1}, VnodeId, PNCount);
+                              {Size+1, count_pncounter:update({decrement, N*-1}, VnodeId, PNCount)};
                           P ->
-                              count_pncounter:update({increment, P}, VnodeId, PNCount)
+                              {Size+1, count_pncounter:update({increment, P}, VnodeId, PNCount)}
                       end
               end,
-    Acc = count_pncounter:new(),
-    PNCounter = hanoidb:fold_range(StorageState, FoldFun, Acc, KeyRange),
+    Acc = {0, PNCounter0},
+    {Size, PNCounter} = hanoidb:fold_range(StorageState, FoldFun, Acc, KeyRange),
+    lager:info("read size was ~p~n", [Size]),
     Reply = case PNCounter of
-                Acc -> notfound;
+                [{},{}] -> notfound; %% Empty PN-Counter, BAD, relies on knowledge of internal datastructure
                 _ -> {ok, {count_pncounter, PNCounter}}
             end,
+    %% Checkpoint the counter again
+    case Size > 0 of
+        true ->
+            ok = save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter});
+        _ -> ok
+    end,
     {reply, {ReqId, {{Idx, Node}, Reply}}, State};
 handle_command({repair, Key, PNCounter}, _Sender, State) ->
     %% Not implemented yet
@@ -156,7 +171,13 @@ handle_coverage(_Req, _KeySpaces, _Sender, State) ->
 handle_exit(_Pid, _Reason, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
+
+terminate(_Reason, undefined) ->
+    ok;
+terminate(_Reason, State) ->
+    #state{op_count = OpCount, storage_state = StorageState} = State,
+    store_opcount(StorageState, OpCount),
+    stop_storage(StorageState),
     ok.
 
 %% ---------
@@ -192,22 +213,64 @@ get_data_dir(Partition) ->
     {ok, PartitionRoot}.
 
 store(StorageState, Key, Value) ->
-    ok = hanoidb:transact(StorageState, [{put, Key, Value}]),
-    ok.
+    hanoidb:transact(StorageState, [{put, Key, Value}]).
 
 make_key_range(Key, Min, Max) ->
     FromKey = counter_key(Key, Min),
     ToKey = counter_key(Key, Max),
-    #key_range{from_key= FromKey, from_inclusive=true, to_key= ToKey, to_inclusive=true}.
+    #key_range{from_key= FromKey, from_inclusive=false, to_key= ToKey, to_inclusive=true}.
 
 counter_key(Key, OpCount) ->
     sext:encode({c, ?COUNTERS, Key, OpCount}).
 
+checkpoint_key(Key) ->
+    sext:encode({s, ?COUNTERS, Key}).
+
+get_checkpoint(StorageState, CheckPointKey) ->
+    case hanoidb:get(StorageState, CheckPointKey) of
+        {ok, Val} ->
+            binary_to_term(Val);
+        not_found ->
+            {0, count_pncounter:new()};
+        Error ->
+            Error
+    end.
+
+save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}) ->
+    %% @TODO shouldn't we then delete the keys we don't need?
+    lager:info("Rollup of at ~p of ~p for ~p~n", [OpCount, count_pncounter:value(PNCounter), sext:decode(CheckPointKey)]),
+    store(StorageState, CheckPointKey, term_to_binary({OpCount, PNCounter})).
+
+store_opcount(StorageState, OpCount) ->
+    lager:info("Op count checkpoint at ~p~n", [OpCount]),
+    Key = op_count_key(),
+    store(StorageState, Key, list_to_binary(integer_to_list(OpCount))).
+
+stop_storage(StorageState) ->
+    ok = hanoidb:close(StorageState).
+
 %% -------
 %% Vnode
 %% -------
-get_op_count() ->
+op_count_key() ->
+    <<$o,$c>>.
+
+maybe_store_opcount(StorageState, OpCount) when OpCount rem ?OP_THRESHOLD =:= 0 ->
+    store_opcount(StorageState, OpCount);
+maybe_store_opcount(_StorageState, _OpCount) ->
+    ok.
+
+get_op_count(StorageState) ->
     %% wtf here?
     %% get largest keys value?
     %% get checkpoint + 1000?
-    0.
+    case hanoidb:get(StorageState, op_count_key()) of
+        {ok, Val0} ->
+            Val = list_to_integer(binary_to_list(Val0)),
+            Val + ?OP_THRESHOLD;
+        _ ->
+            %% No op-count found, ensure a monotonically increasing op count
+            {Mega, Sec, Micro} = erlang:now(),
+            (Mega * 1000000 + Sec) * 1000000 + Micro +?OP_THRESHOLD
+    end.
+
