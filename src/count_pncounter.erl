@@ -25,6 +25,10 @@
 %% API
 -export([new/0, value/1, update/3, merge/2, equal/2]).
 
+-opaque counter() :: {count_gcounter:counter(), count_gcounter:counter()}.
+
+-export_type([counter/0]).
+
 new() ->
     {count_gcounter:new(), count_gcounter:new()}.
 
