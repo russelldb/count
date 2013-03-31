@@ -11,7 +11,6 @@
 -compile([export_all]).
 
 -include("count.hrl").
--include_lib("hanoidb/include/hanoidb.hrl").
 
  %% sext encoded key of {s, counter, Key::binary(), OpCount::non_neg_integer().
 -type rollup_key() :: binary().
@@ -22,18 +21,12 @@
 %% Storage
 %% ---------
 start(Partition) ->
+    Opts =  [{create_if_missing, true},
+             {write_buffer_size, 1024*1024},
+             {max_open_files, 20}],
     %% start hanoi
     {ok, DataDir} = get_data_dir(Partition),
-    case application:start(hanoidb) of
-        Good when Good =:= ok;
-        Good =:= {error, {already_started, hanoidb}} ->
-            open_data_dir(DataDir);
-        Bad ->
-            Bad
-    end.
-
-open_data_dir(DataDir) ->
-    case hanoidb:open(DataDir, []) of
+    case eleveldb:open(DataDir, Opts) of
         {ok, Tree} ->
             {ok, DataDir, Tree};
         Error ->
@@ -47,12 +40,15 @@ get_data_dir(Partition) ->
     {ok, PartitionRoot}.
 
 store(StorageState, Key, Value) ->
-    hanoidb:transact(StorageState, [{put, Key, Value}]).
+    eleveldb:write(StorageState, [{put, Key, Value}], []).
+
+get(StorageState, Key) ->
+    eleveldb:get(StorageState, Key, []).
 
 make_key_range(Key, Min, Max) ->
     FromKey = counter_key(Key, Min),
     ToKey = counter_key(Key, Max),
-    #key_range{from_key= FromKey, from_inclusive=false, to_key= ToKey, to_inclusive=true}.
+    {FromKey, ToKey}.
 
 counter_key(Key, OpCount) ->
     sext:encode({c, ?COUNTERS, Key, OpCount}).
@@ -78,12 +74,11 @@ get_checkpoint(StorageState, Key, OpCount) ->
     CheckPointKey = checkpoint_key(Key, OpCount),
     FromKey = checkpoint_key(Key, 0),
     FoldFun = fun(K, V, {Keys, _Counter}) ->
-                     {[K | Keys],  binary_to_term(V)} end,
+                     {[{delete, K} | Keys],  binary_to_term(V)} end,
     Acc = {[], {0, count_pncounter:new()}},
-    KR = #key_range{from_key= FromKey, from_inclusive=false,
-                    to_key= CheckPointKey,
-                    to_inclusive = true},
-    {CheckPointKey, hanoidb:fold_range(StorageState, FoldFun, Acc, KR)}.
+    KR = {FromKey, CheckPointKey},
+    %% @TODO level style fold fun, mkay, throw to break
+    {CheckPointKey, fold(StorageState, FoldFun, Acc, KR)}.
 
 get_counter(StorageState, Key, OpCount) ->
     {CheckPointKey, {KeysToDelete0, {CPOpCount, PNCounter0}}} = get_checkpoint(StorageState, Key, OpCount),
@@ -97,13 +92,11 @@ get_counter(StorageState, Key, OpCount) ->
                                     P ->
                                         {Size+1, count_pncounter:update({increment, P}, VnodeId, PNCount)}
                                 end,
-                      {[K | Keys], Counter}
+                      {[{delete, K} | Keys], Counter}
               end,
     Acc = {KeysToDelete, {0, PNCounter0}},
-    {KeysToDelete2, {Size, PNCounter}} = hanoidb:fold_range(StorageState, FoldFun, Acc, KeyRange),
-
-    hanoidb:fold(StorageState, fun(K, V, _Acc) when K /= ?OP_COUNT_KEY -> lager:info("K ~p V ~p", [sext:decode(K), binary_to_term(V)]);
-                                  (K, V, _Acc) -> lager:info("K ~p V ~p", [K, V]) end, ok),
+    %% @TODO level style fold fun, throw to break
+    {KeysToDelete2, {Size, PNCounter}} = fold(StorageState, FoldFun, Acc, KeyRange),
     {CheckPointKey, KeysToDelete2, Size, PNCounter}.
 
 save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}) ->
@@ -112,15 +105,33 @@ save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}) ->
     store(StorageState, CheckPointKey, term_to_binary({OpCount, PNCounter})).
 
 delete(StorageState, Keys) ->
-    Out = [sext:decode(K) || K <- Keys],
-    lager:info("deleting  ~p", [Out]),
-    Dels = [{delete, Key} || Key <- Keys],
-    ok = hanoidb:transact(StorageState, Dels).
+    lager:info("Deleting, ~p keys", [length(Keys)]),
+    ok = eleveldb:write(StorageState, Keys, []).
 
 stop(StorageState) ->
-    ok = hanoidb:close(StorageState).
+    ok = eleveldb:close(StorageState).
 
 remove_current_rollup_key([]) ->
     [];
 remove_current_rollup_key([_H|T]) ->
     T.
+
+%% Level db needs you to declare the limit of the fold
+%% a KeyRange is just a {from key, to key} tuple
+%% this makes key ranges that exclude the from key but include the to key.
+fold_fun(Fun, {From, To}) ->
+    fun({K, V}, Acc) when  From < K,
+                           To >= K ->
+            Fun(K, V, Acc);
+       (_, Acc) ->
+            throw({break, Acc})
+    end.
+
+fold(StorageState, Fun, Acc, {FirstKey, _}=KR) ->
+    FoldFun = fold_fun(Fun, KR),
+    try
+        eleveldb:fold(StorageState, FoldFun, Acc, [{first_key, FirstKey}, {fill_cache, false}])
+    catch
+        {break, FinalAcc} ->
+            FinalAcc
+    end.
