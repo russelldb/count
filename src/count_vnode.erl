@@ -10,7 +10,6 @@
 -module(count_vnode).
 -behaviour(riak_core_vnode).
 -include_lib("riak_core/include/riak_core_vnode.hrl").
--include_lib("hanoidb/include/hanoidb.hrl").
 -include("count.hrl").
 
 %% API
@@ -37,10 +36,13 @@
                 op_count :: pos_integer(), %% monotonically increasing count of operations
                 storage_state :: term(),
                 vnode_id :: term(),
-                partition :: partition()}).
+                partition :: partition(),
+                dirty_keys_tid :: ets:tid()}). %% Worst case could mean holding _all_ keys in
+                                               %% memory, should bound size, evict by age / lru?
 
 -define(MASTER, count_vnode_master).
 -define(OP_THRESHOLD, 1000).
+-define(ETS_OPTS, [ordered_set, private]).
 
 %% API
 start_vnode(I) ->
@@ -67,47 +69,81 @@ repair(PrefList, Key, PNCounter) ->
     riak_core_vnode_master:command(PrefList, {repair, Key, PNCounter}, ignore, ?MASTER).
 
 init([Partition]) ->
+    %% Should scan all keys and build rollups in case a key too a lot
+    %% of writes, but we crashed before the threshold, or it was never
+    %% read, and remains unrolled up forever.
     Node = node(),
     random:seed(erlang:now()),
     VnodeId = uuid:v4(),
-    {ok, DataDir, StorageState} = start_storage(Partition),
+    {ok, DataDir, StorageState} = count_db:start(Partition),
     OpCount = get_op_count(StorageState),
-    lager:info("Started ~p with op count ~p~n", [Partition, OpCount]),
+    DirtyKeysTid = ets:new(?MODULE, ?ETS_OPTS),
+    PoolSize = app_helper:get_env(count, worker_pool_size, 10), %% realy?
+    %% pool size is sort of HOT key size, so a heuristic would be better
     {ok, #state { data_dir = DataDir,
                   node = Node,
                   op_count = OpCount,
                   storage_state = StorageState,
                   vnode_id = VnodeId,
-                  partition = Partition
-                }}.
+                  partition = Partition,
+                  dirty_keys_tid = DirtyKeysTid
+                },
+     [{pool, count_vnode_worker, PoolSize, []}]}.
 
-handle_command({increment, Key, Amount}, _Sender, State) ->
-    #state{storage_state=StorageState, vnode_id=VnodeId, op_count=OpCount0} = State,
+handle_command({increment, Key, Amount}, Sender, State0) ->
+    #state{storage_state=StorageState, vnode_id=VnodeId,
+           op_count=OpCount0, dirty_keys_tid=DirtyKeysTid} = State0,
     OpCount = OpCount0+1,
-    OpKey = counter_key(Key, OpCount),
+    OpKey = count_db:counter_key(Key, OpCount),
     Val = term_to_binary({VnodeId, Amount}),
-    store(StorageState, OpKey, Val),
+    count_db:store(StorageState, OpKey, Val),
+    riak_core_vnode:reply(Sender, {ok, Val}),
+    ets:insert_new(DirtyKeysTid, {Key, 0}),
+    UpdateCount = ets:update_counter(DirtyKeysTid, Key, 1),
+    State = State0#state{op_count=OpCount},
+    Out = case UpdateCount >= ?OP_THRESHOLD of
+              true ->
+                  %% Should we somehow "lock" here, to preserve
+                  %% the keys op count, but not try and  roll up
+                  %% for some same period of time
+                  %% for now, naively, just assume rollups work
+                  ets:delete(DirtyKeysTid, Key),
+                  {async, {rollup, Key, OpCount, StorageState}, ignore, State};
+              false -> {noreply, State}
+          end,
     maybe_store_opcount(StorageState, OpCount),
-    {reply, {ok, Val}, State#state{op_count=OpCount}};
-handle_command({merge, Key, Val, ReqId}, _Sender, State) ->
-    #state{storage_state=StorageState, op_count=OpCount0} = State,
+    Out;
+handle_command({merge, Key, Val, ReqId}, Sender, State0) ->
+    #state{storage_state=StorageState, op_count=OpCount0, dirty_keys_tid=DirtyKeysTid} = State0,
     OpCount = OpCount0 + 1,
-    OpKey = counter_key(Key, OpCount),
-    store(StorageState, OpKey, Val),
+    OpKey = count_db:counter_key(Key, OpCount),
+    count_db:store(StorageState, OpKey, Val),
+    riak_core_vnode:reply(Sender, {ReqId, ok}),
+    ets:insert_new(DirtyKeysTid, {Key, 0}),
+    UpdateCount =  ets:update_counter(DirtyKeysTid, Key, 1),
+    State = State0#state{op_count=OpCount},
+    Out = case UpdateCount >= ?OP_THRESHOLD of
+              true ->
+                  %% Should we somehow "lock" here, to preserve
+                  %% the keys op count, but not try and  roll up
+                  %% for some same period of time
+                  %% for now, naively, just assume rollups work
+                  ets:delete(DirtyKeysTid, Key),
+                  {async, {rollup, Key, OpCount, StorageState}, ignore, State};
+              false -> {noreply, State}
+          end,
     maybe_store_opcount(StorageState, OpCount),
-    {reply, {ReqId, ok}, State#state{op_count=OpCount}};
-handle_command({get, Key, ReqId}, _Sender, State) ->
-    #state{storage_state=StorageState, op_count=OpCount, partition=Idx, node=Node} = State,
+    Out;
+handle_command({get, Key, ReqId}, Sender, State) ->
+    #state{storage_state=StorageState, op_count=OpCount,
+           partition=Idx, node=Node, dirty_keys_tid=DirtyKeysTid} = State,
     %% Fold from Key, LowestPossibleOpCount
-    %% (LPOC should be the last snapshotted opcount
-    %% for that Key (where is that, hmmm?)
-    %% but for now, use zero)
-    %% To Key, CurrentOpCount)
+    %% (LPOC should be the last snapshotted opcount)
+    %% To Key, CurrentOpCount
     %% then turn all those elements
     %% into a PN-Counter and return it
-    %% Checkpointed counter is stored on disk as a state based CRDT
-    %% and an opcount, at Key, get that
-    {CheckPointKey, Size, PNCounter} = local_get(StorageState, Key, OpCount),
+    %% Checkpointed counter is stored on disk as {OpCount, a state based CRDT}
+    {CheckPointKey, KeysToDelete, Size, PNCounter} = count_db:get_counter(StorageState, Key, OpCount),
     lager:info("read size was ~p~n", [Size]),
     Reply = case PNCounter of
                 {[], []} -> notfound; %% Empty PN-Counter, BAD, relies on knowledge of internal datastructure
@@ -116,23 +152,37 @@ handle_command({get, Key, ReqId}, _Sender, State) ->
     %% Checkpoint the counter again
     case Size > 0 of
         true ->
-            ok = save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter});
+            ok = count_db:save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}),
+            ets:delete(DirtyKeysTid, Key);
         _ -> ok
     end,
-    {reply, {ReqId, {{Idx, Node}, Reply}}, State};
-handle_command({repair, Key, {count_pncounter, PNCounter}}, _Sender, State) ->
+    riak_core_vnode:reply(Sender, {ReqId, {{Idx, Node}, Reply}}),
+    Out = case KeysToDelete of
+              [] ->
+                  {noreply, State};
+              _ -> {async, {delete, KeysToDelete, StorageState}, ignore, State}
+          end,
+    Out;
+handle_command({repair, Key, {count_pncounter, PNCounter}}, Sender, State) ->
     lager:info("Getting read repaired at key ~p with val ~p~n", [Key, PNCounter]),
-    #state{op_count=OpCount, storage_state=StorageState} = State,
+    #state{op_count=OpCount, storage_state=StorageState, dirty_keys_tid=DirtyKeysTid} = State,
     %% Read reair receives a state based PN-Counter, it seems the best thing to do
     %% is do a local get (merge with the rr counter, and save the rollup)
-    {CheckPointKey, _Size, LocalCounter} = local_get(StorageState, Key, OpCount),
+    {CheckPointKey, KeysToDelete, _Size, LocalCounter} = coount_db:get_counter(StorageState, Key, OpCount),
     Merged = count_pncounter:merge(PNCounter, LocalCounter),
     case count_pncounter:equal(Merged, LocalCounter) of
         false ->
-            save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter});
+            count_db:save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}),
+            ets:delete(DirtyKeysTid, Key);
         true -> ok
     end,
-    {reply, ok, State};
+    riak_core_vnode:reply(Sender, ok),
+    Out = case KeysToDelete of
+              [] ->
+                  {noreply, State};
+              _ -> {async, {delete, KeysToDelete, StorageState}, ignore, State}
+          end,
+    Out;
 handle_command(Message, _Sender, State) ->
     ?PRINT({unhandled_command, Message}),
     {noreply, State}.
@@ -167,122 +217,37 @@ handle_coverage(_Req, _KeySpaces, _Sender, State) ->
 handle_exit(_Pid, _Reason, State) ->
     {noreply, State}.
 
-
 terminate(_Reason, undefined) ->
     ok;
 terminate(_Reason, State) ->
     #state{op_count = OpCount, storage_state = StorageState} = State,
     store_opcount(StorageState, OpCount),
-    stop_storage(StorageState),
+    count_db:stop(StorageState),
     ok.
 
 %% ---------
 %% Private
 %% ---------
 
-%% ---------
-%% Storage
-%% ---------
-start_storage(Partition) ->
-    %% start hanoi
-    {ok, DataDir} = get_data_dir(Partition),
-    case application:start(hanoidb) of
-        Good when Good =:= ok;
-        Good =:= {error, {already_started, hanoidb}} ->
-            open_data_dir(DataDir);
-        Bad ->
-            Bad
-    end.
-
-open_data_dir(DataDir) ->
-    case hanoidb:open(DataDir, []) of
-        {ok, Tree} ->
-            {ok, DataDir, Tree};
-        Error ->
-            Error
-    end.
-
-get_data_dir(Partition) ->
-    DataRoot = app_helper:get_env(count, data_root, "./data/count_hanoi"),
-    PartitionRoot = filename:join(DataRoot, integer_to_list(Partition)),
-    ok = filelib:ensure_dir(filename:join(PartitionRoot, ".dummy")),
-    {ok, PartitionRoot}.
-
-store(StorageState, Key, Value) ->
-    hanoidb:transact(StorageState, [{put, Key, Value}]).
-
-make_key_range(Key, Min, Max) ->
-    FromKey = counter_key(Key, Min),
-    ToKey = counter_key(Key, Max),
-    #key_range{from_key= FromKey, from_inclusive=false, to_key= ToKey, to_inclusive=true}.
-
-counter_key(Key, OpCount) ->
-    sext:encode({c, ?COUNTERS, Key, OpCount}).
-
-checkpoint_key(Key) ->
-    sext:encode({s, ?COUNTERS, Key}).
-
-get_checkpoint(StorageState, CheckPointKey) ->
-    case hanoidb:get(StorageState, CheckPointKey) of
-        {ok, Val} ->
-            binary_to_term(Val);
-        not_found ->
-            {0, count_pncounter:new()};
-        Error ->
-            Error
-    end.
-
-save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}) ->
-    %% @TODO shouldn't we then delete the keys we don't need?
-    lager:info("Rollup of at ~p of ~p for ~p~n", [OpCount, count_pncounter:value(PNCounter), sext:decode(CheckPointKey)]),
-    store(StorageState, CheckPointKey, term_to_binary({OpCount, PNCounter})).
-
-store_opcount(StorageState, OpCount) ->
-    lager:info("Op count checkpoint at ~p~n", [OpCount]),
-    Key = op_count_key(),
-    store(StorageState, Key, list_to_binary(integer_to_list(OpCount))).
-
-stop_storage(StorageState) ->
-    ok = hanoidb:close(StorageState).
-
-%% -------
-%% Vnode
-%% -------
-local_get(StorageState, Key, OpCount) ->
-    CheckPointKey = checkpoint_key(Key),
-    {CPOpCount, PNCounter0} = get_checkpoint(StorageState, CheckPointKey),
-    KeyRange = make_key_range(Key, CPOpCount, OpCount),
-    FoldFun = fun(_K, V, {Size, PNCount}) ->
-                      {VnodeId, Count} = binary_to_term(V),
-                      case Count of
-                          N when N < 0 ->
-                              {Size+1, count_pncounter:update({decrement, N*-1}, VnodeId, PNCount)};
-                          P ->
-                              {Size+1, count_pncounter:update({increment, P}, VnodeId, PNCount)}
-                      end
-              end,
-    Acc = {0, PNCounter0},
-    {Size, PNCounter} = hanoidb:fold_range(StorageState, FoldFun, Acc, KeyRange),
-    {CheckPointKey, Size, PNCounter}.
-
-op_count_key() ->
-    <<$o,$c>>.
-
 maybe_store_opcount(StorageState, OpCount) when OpCount rem ?OP_THRESHOLD =:= 0 ->
     store_opcount(StorageState, OpCount);
 maybe_store_opcount(_StorageState, _OpCount) ->
     ok.
 
+store_opcount(StorageState, OpCount) ->
+    lager:info("Op count checkpoint at ~p~n", [OpCount]),
+    count_db:store(StorageState, ?OP_COUNT_KEY, list_to_binary(integer_to_list(OpCount))).
+
 get_op_count(StorageState) ->
-    %% wtf here?
-    %% get largest keys value?
-    %% get checkpoint + 1000?
-    case hanoidb:get(StorageState, op_count_key()) of
+    case count_db:get(StorageState, ?OP_COUNT_KEY) of
         {ok, Val0} ->
             Val = list_to_integer(binary_to_list(Val0)),
             Val + ?OP_THRESHOLD;
         _ ->
-            %% No op-count found, ensure a monotonically increasing op count
+            %% No op-count found, ensure a monotonically increasing op count.
+            %% Won't OP_THRESHOLD + 1 do? Either this
+            %% vnode is new, has a checkpoint, or crashed before (during?)
+            %% writing it's checkpoint
             {Mega, Sec, Micro} = erlang:now(),
             (Mega * 1000000 + Sec) * 1000000 + Micro +?OP_THRESHOLD
     end.
