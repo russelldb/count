@@ -187,6 +187,12 @@ handle_command(Message, _Sender, State) ->
     ?PRINT({unhandled_command, Message}),
     {noreply, State}.
 
+
+%% @doc Handles commands while in the handoff state.
+handle_handoff_command(?FOLD_REQ{foldfun=Fun, acc0=Acc0}, Sender,
+                       State=#state{storage_state=StorageState}) ->
+    HandoffFoldFun = count_db:fold_and_rollup(StorageState, Fun, Acc0),
+    {async, {handoff, HandoffFoldFun}, Sender, State};
 handle_handoff_command(_Message, _Sender, State) ->
     {noreply, State}.
 

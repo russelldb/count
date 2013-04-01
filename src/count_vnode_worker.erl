@@ -32,7 +32,9 @@ handle_work({rollup, Key, OpCount, StorageState}, _Sender, State) ->
     {noreply, State};
 handle_work({delete, KeyList, StorageState}, _Sender, State) ->
     delete(KeyList, StorageState),
-    {noreply, State}.
+    {noreply, State};
+handle_work({handoff, FoldFun}, _Sender, State) ->
+    {reply, FoldFun(), State}.
 
 %%%===================================================================
 %%% Internal functions

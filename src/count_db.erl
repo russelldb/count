@@ -135,3 +135,65 @@ fold(StorageState, Fun, Acc, {FirstKey, _}=KR) ->
         {break, FinalAcc} ->
             FinalAcc
     end.
+
+fold_and_rollup(StorageState, Fun, HoffAcc) ->
+    %% Fold over op log for key, roll into PN counter and send.
+    %% fold over PN counters send largest per key
+    %% worst case sending two counters per key
+    %% worst case is that we read ?OP_THRESHOLD items
+    %% per key (i.e. all keys are dirty, and just under the threshold for a rollup)
+    FirstKey = counter_key(<<>>, 0),
+    %% Finish at the ?OP_COUNT
+    FinalKey = ?OP_COUNT_KEY,
+    FoldFun = fun({K, V}, {LastType, LastKey, PNCounter, Acc}) when K > FirstKey, K < FinalKey ->
+                      case sext:decode(K) of
+                          {c, _, LastKey, _} ->
+                              {VnodeId, Amount} = binary_to_term(V),
+                              {c, LastKey, update_pn_counter(PNCounter, VnodeId, Amount), Acc};
+                          {c, _, NewKey, _} ->
+                              Acc2 = case LastKey of
+                                         undefined ->
+                                             Acc;
+                                         _ -> Fun(LastKey, PNCounter, Acc)%% hand off this roll up of op keys and start the next
+                                     end,
+                              {VnodeId, Amount} = binary_to_term(V),
+                              {c, NewKey, update_pn_counter(count_pn_counter:new(), VnodeId, Amount), Acc2};
+                          {s, _, LastKey, _} when LastType == s ->
+                              {s, LastKey, binary_to_term(V), Acc}; %% always take the largest rolled up counter
+                          {s, _, NewKey, _} when LastType == s  ->
+                              Acc2 = case LastKey of
+                                         undefined ->
+                                             Acc;
+                                         _ -> Fun(LastKey, PNCounter, Acc)
+                                     end,
+                              {s, NewKey, binary_to_term(V), Acc2};
+                          {s, _, NewKey, _} ->
+                              Counter = binary_to_term(V),
+                              %% crossed over from from op log to roll up in the key space.
+                              %% Send the rolled up op log
+                              %% if there is one
+                              Acc2 = case LastKey of
+                                         undefined -> Acc;
+                                         _ -> Fun(NewKey, PNCounter, Acc)
+                                     end,
+                              {s, NewKey, Counter, Acc2}
+                      end;
+                 (_, Final) ->
+                      throw({break, Final})
+              end,
+
+    Acc = {c, undefined, count_pn_counter:new(), HoffAcc},
+
+    fun() ->
+            try
+                eleveldb:fold(StorageState, FoldFun, Acc, [{first_key, FirstKey}, {fill_cache, false}])
+            catch
+                {break, FinalAcc} ->
+                    FinalAcc
+            end
+    end.
+
+update_pn_counter(Counter, VnodeId, Amount) when Amount < 0 ->
+    count_pn_counter:update({decrement, -1 * Amount}, VnodeId, Counter);
+update_pn_counter(Counter, VnodeId, Amount) ->
+    count_pn_counter:update({increment, Amount}, VnodeId, Counter).
