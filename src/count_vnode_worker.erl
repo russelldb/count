@@ -34,6 +34,7 @@ handle_work({delete, KeyList, StorageState}, _Sender, State) ->
     delete(KeyList, StorageState),
     {noreply, State};
 handle_work({handoff, FoldFun}, _Sender, State) ->
+    lager:info("async handoff"),
     {reply, FoldFun(), State}.
 
 %%%===================================================================

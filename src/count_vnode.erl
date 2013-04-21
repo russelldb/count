@@ -168,7 +168,7 @@ handle_command({repair, Key, {count_pncounter, PNCounter}}, Sender, State) ->
     #state{op_count=OpCount, storage_state=StorageState, dirty_keys_tid=DirtyKeysTid} = State,
     %% Read reair receives a state based PN-Counter, it seems the best thing to do
     %% is do a local get (merge with the rr counter, and save the rollup)
-    {CheckPointKey, KeysToDelete, _Size, LocalCounter} = coount_db:get_counter(StorageState, Key, OpCount),
+    {CheckPointKey, KeysToDelete, _Size, LocalCounter} = count_db:get_counter(StorageState, Key, OpCount),
     Merged = count_pncounter:merge(PNCounter, LocalCounter),
     case count_pncounter:equal(Merged, LocalCounter) of
         false ->
@@ -191,15 +191,18 @@ handle_command(Message, _Sender, State) ->
 %% @doc Handles commands while in the handoff state.
 handle_handoff_command(?FOLD_REQ{foldfun=Fun, acc0=Acc0}, Sender,
                        State=#state{storage_state=StorageState}) ->
+    lager:info("they said handoff"),
     HandoffFoldFun = count_db:fold_and_rollup(StorageState, Fun, Acc0),
     {async, {handoff, HandoffFoldFun}, Sender, State};
 handle_handoff_command(_Message, _Sender, State) ->
     {noreply, State}.
 
-handoff_starting(_TargetNode, State) ->
+handoff_starting(TargetNode, State) ->
+    lager:info("handoff starting ~p", [TargetNode]),
     {true, State}.
 
 handoff_cancelled(State) ->
+    lager:info("handoff cancelled"),
     {ok, State}.
 
 handoff_finished(_TargetNode, State) ->
@@ -208,8 +211,9 @@ handoff_finished(_TargetNode, State) ->
 handle_handoff_data(Data, State) ->
     #state{op_count=OpCount, storage_state=StorageState, dirty_keys_tid=DirtyKeysTid} = State,
     {Key, PNCounter} = binary_to_term(Data),
+    lager:info("received handoff data ~p", [Key]),
     %% Merge this, just like a repair
-    {CheckPointKey, KeysToDelete, _Size, LocalCounter} = coount_db:get_counter(StorageState, Key, OpCount),
+    {CheckPointKey, KeysToDelete, _Size, LocalCounter} = count_db:get_counter(StorageState, Key, OpCount),
     Merged = count_pncounter:merge(PNCounter, LocalCounter),
     case count_pncounter:equal(Merged, LocalCounter) of
         false ->
@@ -223,12 +227,14 @@ handle_handoff_data(Data, State) ->
           end,
     Out.
 
-
 encode_handoff_item(ObjectName, ObjectValue) ->
+    io:format("Handing off ~p", [ObjectName]),
     term_to_binary({ObjectName, ObjectValue}).
 
 is_empty(State) ->
-    {true, State}.
+    #state{storage_state=StorageState} = State,
+    IsEmpty = count_db:is_empty(StorageState),
+    {IsEmpty, State}.
 
 delete(State) ->
     {ok, State}.
