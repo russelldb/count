@@ -205,11 +205,27 @@ handoff_cancelled(State) ->
 handoff_finished(_TargetNode, State) ->
     {ok, State}.
 
-handle_handoff_data(_Data, State) ->
-    {reply, ok, State}.
+handle_handoff_data(Data, State) ->
+    #state{op_count=OpCount, storage_state=StorageState, dirty_keys_tid=DirtyKeysTid} = State,
+    {Key, PNCounter} = binary_to_term(Data),
+    %% Merge this, just like a repair
+    {CheckPointKey, KeysToDelete, _Size, LocalCounter} = coount_db:get_counter(StorageState, Key, OpCount),
+    Merged = count_pncounter:merge(PNCounter, LocalCounter),
+    case count_pncounter:equal(Merged, LocalCounter) of
+        false ->
+            count_db:save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}),
+            ets:delete(DirtyKeysTid, Key);
+        true -> ok
+    end,
+    Out = case KeysToDelete of
+              [] -> {reply, ok, State};
+              _ -> {async, {delete, KeysToDelete, StorageState}, ignore, State}
+          end,
+    Out.
 
-encode_handoff_item(_ObjectName, _ObjectValue) ->
-    <<>>.
+
+encode_handoff_item(ObjectName, ObjectValue) ->
+    term_to_binary({ObjectName, ObjectValue}).
 
 is_empty(State) ->
     {true, State}.
