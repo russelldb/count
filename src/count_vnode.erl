@@ -217,27 +217,29 @@ handle_handoff_data(Data, State) ->
     Merged = count_pncounter:merge(PNCounter, LocalCounter),
     case count_pncounter:equal(Merged, LocalCounter) of
         false ->
-            count_db:save_checkpoint(StorageState, CheckPointKey, {OpCount, PNCounter}),
+            lager:info("local value is ~p merged value is ~p", [count_pncounter:value(LocalCounter), count_pncounter:value(Merged)]),
+            count_db:save_checkpoint(StorageState, CheckPointKey, {OpCount, Merged}),
             ets:delete(DirtyKeysTid, Key);
         true -> ok
     end,
-    Out = case KeysToDelete of
-              [] -> {reply, ok, State};
-              _ -> {async, {delete, KeysToDelete, StorageState}, ignore, State}
-          end,
-    Out.
+    count_db:delete(StorageState, KeysToDelete),
+    {reply, ok, State#state{op_count=OpCount+1}}.
 
 encode_handoff_item(ObjectName, ObjectValue) ->
-    io:format("Handing off ~p", [ObjectName]),
+    lager:info("Handing off ~p", [ObjectName]),
     term_to_binary({ObjectName, ObjectValue}).
 
 is_empty(State) ->
     #state{storage_state=StorageState} = State,
     IsEmpty = count_db:is_empty(StorageState),
+    lager:info("Is empty ~p", [IsEmpty]),
     {IsEmpty, State}.
 
 delete(State) ->
-    {ok, State}.
+    #state{storage_state=StorageState, partition=Partition, data_dir=DataDir} = State,
+    ok = count_db:drop(StorageState, DataDir),
+    {ok, DataDir, StorageState2} = count_db:start(Partition),
+    {ok, State#state{data_dir=DataDir, storage_state=StorageState2}}.
 
 handle_coverage(_Req, _KeySpaces, _Sender, State) ->
     {stop, not_implemented, State}.

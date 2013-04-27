@@ -90,12 +90,10 @@ execute(timeout, SD=#state{preflist=Preflist, key=Key, req_id=ReqId}) ->
 %% @doc Gather some responses, and merge them
 await_r({ReqId, Reply}, SD0=#state{req_id=ReqId, num_r=NumR0, replies=Replies}) ->
     NumR = NumR0 + 1,
-    lager:info("got reply ~p~n", [Reply]),
     Replies2 = [Reply|Replies],
     SD = SD0#state{num_r=NumR, replies=Replies2},
     if
         NumR =:= 2 ->
-            lager:info("Calling replies with ~p~n", [Replies2]),
             Result = value(Replies2),
             client_reply(Result, SD),
             {next_state, await_n, SD};

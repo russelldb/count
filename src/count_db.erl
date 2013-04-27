@@ -15,7 +15,7 @@
  %% sext encoded key of {s, counter, Key::binary(), OpCount::non_neg_integer().
 -type rollup_key() :: binary().
 -type rollup_counter() :: {OpCount::non_neg_integer(),
-                           count_pn_counter:counter()}.
+                           count_pncounter:counter()}.
 
 %% ---------
 %% Storage
@@ -53,6 +53,9 @@ make_key_range(Key, Min, Max) ->
 counter_key(Key, OpCount) ->
     sext:encode({c, ?COUNTERS, Key, OpCount}).
 
+checkpoint_key(Key, OpCount) ->
+    sext:encode({s, ?COUNTERS, Key, OpCount}).
+
 %% Use the Opcount in the key
 %% since we aysnchronously rollup
 %% counters in the background
@@ -65,9 +68,6 @@ counter_key(Key, OpCount) ->
 %% (and deleting the rest?)
 %% returns the rolled up counter,
 %% and a key it should be stored under
-checkpoint_key(Key, OpCount) ->
-    sext:encode({s, ?COUNTERS, Key, OpCount}).
-
 -spec get_checkpoint(term(), binary(), non_neg_integer()) ->
                             {rollup_key(), rollup_counter()}.
 get_checkpoint(StorageState, Key, OpCount) ->
@@ -146,43 +146,71 @@ fold_and_rollup(StorageState, Fun, HoffAcc) ->
     %% Finish at the ?OP_COUNT
     FinalKey = ?OP_COUNT_KEY,
     FoldFun = fun({K, V}, {LastType, LastKey, PNCounter, Acc}) when K > FirstKey, K < FinalKey ->
-                      case sext:decode(K) of
+                      DK = sext:decode(K),
+                      lager:info("Looking at key ~p", [DK]),
+                      case DK of
                           {c, _, LastKey, _} ->
                               {VnodeId, Amount} = binary_to_term(V),
-                              {c, LastKey, update_pn_counter(PNCounter, VnodeId, Amount), Acc};
+                              lager:info("HOFF, last key c"),
+                              A = {c, LastKey, update_pn_counter(PNCounter, VnodeId, Amount), Acc},
+                              lager:info("HOFF lk c updated"),
+                              A;
                           {c, _, NewKey, _} ->
                               Acc2 = case LastKey of
                                          undefined ->
+                                             lager:info("New key, lk undef"),
                                              Acc;
-                                         _ -> Fun(LastKey, PNCounter, Acc)%% hand off this roll up of op keys and start the next
+                                         _ ->
+                                             lager:info("new key, lk def, calling F"),
+                                             %% hand off this roll up of op keys and start the next
+                                             A = Fun(LastKey, PNCounter, Acc),
+                                             lager:info("Called hoff fun"),
+                                             A
                                      end,
                               {VnodeId, Amount} = binary_to_term(V),
-                              {c, NewKey, update_pn_counter(count_pn_counter:new(), VnodeId, Amount), Acc2};
+                              lager:info("Starting new local acc for new key"),
+                              A2 = {c, NewKey, update_pn_counter(count_pncounter:new(), VnodeId, Amount), Acc2},
+                              lager:info("Updated empty new pn counter"),
+                              A2;
                           {s, _, LastKey, _} when LastType == s ->
-                              {s, LastKey, binary_to_term(V), Acc}; %% always take the largest rolled up counter
+                              {_OpCount, Counter} = binary_to_term(V),
+                              {s, LastKey, Counter, Acc}; %% always take the largest rolled up counter
                           {s, _, NewKey, _} when LastType == s  ->
                               Acc2 = case LastKey of
                                          undefined ->
                                              Acc;
                                          _ -> Fun(LastKey, PNCounter, Acc)
                                      end,
-                              {s, NewKey, binary_to_term(V), Acc2};
+                              {_OpCount, Counter} = binary_to_term(V),
+                              {s, NewKey, Counter, Acc2};
                           {s, _, NewKey, _} ->
-                              Counter = binary_to_term(V),
+                              lager:info("crossed boundary"),
+                              {_OpCount, Counter} = binary_to_term(V),
                               %% crossed over from from op log to roll up in the key space.
                               %% Send the rolled up op log
                               %% if there is one
                               Acc2 = case LastKey of
-                                         undefined -> Acc;
-                                         _ -> Fun(NewKey, PNCounter, Acc)
+                                         undefined ->
+                                             lager:info("no last c key"),
+                                             Acc;
+                                         _ ->
+                                             lager:info("calling hoff with c rollup"),
+                                             A = Fun(NewKey, PNCounter, Acc),
+                                             lager:info("called hoff with c rollup"),
+                                             A
                                      end,
-                              {s, NewKey, Counter, Acc2}
+                              {s, NewKey, Counter, Acc2};
+                          SomethingElse -> lager:info("Got a key of ~p wtf?", [SomethingElse])
                       end;
                  (_, Final) ->
-                      throw({break, Final})
+                      lager:info("finished with ~p", [Final]),
+                      {_, K, C, Acc} = Final,
+                      A = Fun(K, C, Acc),
+                      lager:info("called hoff with c rollup"),
+                      throw({break, A})
               end,
 
-    Acc = {c, undefined, count_pn_counter:new(), HoffAcc},
+    Acc = {c, undefined, count_pncounter:new(), HoffAcc},
 
     fun() ->
             try
@@ -194,6 +222,26 @@ fold_and_rollup(StorageState, Fun, HoffAcc) ->
     end.
 
 update_pn_counter(Counter, VnodeId, Amount) when Amount < 0 ->
-    count_pn_counter:update({decrement, -1 * Amount}, VnodeId, Counter);
+    count_pncounter:update({decrement, -1 * Amount}, VnodeId, Counter);
 update_pn_counter(Counter, VnodeId, Amount) ->
-    count_pn_counter:update({increment, Amount}, VnodeId, Counter).
+    count_pncounter:update({increment, Amount}, VnodeId, Counter).
+
+is_empty(StorageState) ->
+    %% fold from empty to OP_COUNT
+    %% If there is _only_ an OP_COUNT, then we're empty
+    FoldFun = fun({K, _V}, _Acc) when K == ?OP_COUNT_KEY ->
+                      throw({break, true});
+                 (_, _Acc) ->
+                      throw({break, false})
+              end,
+    try
+        eleveldb:fold(StorageState, FoldFun, true, [{first_key, <<>>}, {fill_cache, false}])
+    catch
+        {break, Res} ->
+            Res
+    end.
+
+drop(StorageState, DataDir) ->
+    lager:info("Dropping ~p", [DataDir]),
+    eleveldb:close(StorageState),
+    eleveldb:destroy(DataDir, []).
